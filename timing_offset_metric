@@ -1,0 +1,217 @@
+
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+LIBRARY Packages;
+USE Packages.pkg_customMath.all;
+
+entity timing_offset_metric is
+  generic (
+		g_subseq_length         : integer  := 1024; --! In an OFDM system, typically but not necessaryly the FFT length.
+		g_sampleResolution      : integer  := 8    --! Should be normally in range between 6 and 16. Generic signed.(-128 upto 127)
+    	);
+  port(
+		IN_clk               : in std_logic;
+		
+		IN_rst               : in std_logic;
+		
+		IN_dataReal          : in std_logic_vector(g_sampleResolution - 1 downto 0);
+		IN_dataImag          : in std_logic_vector(g_sampleResolution - 1 downto 0);
+		IN_dataValid         : in std_logic;
+		
+		OUT_dataReal          : out std_logic_vector(g_sampleResolution - 1 downto 0);
+		OUT_dataImag          : out std_logic_vector(g_sampleResolution - 1 downto 0);
+		OUT_dataValid         : out std_logic;
+		OUT_syncMetric        : out std_logic_vector(31 downto 0)
+	);
+end timing_offset_metric;
+
+architecture structural of timing_offset_metric is
+-- fifo IP declaration from Xilinx
+
+component correlation_metric
+    generic (
+  		g_subseq_length       : integer  := 1024;
+  		g_sampleResolution    : integer  := 8
+      	);
+    port(
+  		IN_clk                : in std_logic;
+  		IN_rst                : in std_logic;
+  		IN_dataReal           : in std_logic_vector(g_sampleResolution - 1 downto 0);
+  		IN_dataImag           : in std_logic_vector(g_sampleResolution - 1 downto 0);
+  		IN_dataValid          : in std_logic;  		
+  		OUT_result            : out std_logic_vector(31 downto 0)
+  	);
+end component;
+component half_symbol_energy
+  generic (
+  		g_subseq_length      : integer  := 1024;
+  		g_sampleResolution   : integer  := 8
+      	);
+  port(	IN_clk               : in std_logic;
+  		IN_rst               : in std_logic;
+  		IN_dataReal          : in std_logic_vector(g_sampleResolution - 1 downto 0);
+  		IN_dataImag          : in std_logic_vector(g_sampleResolution - 1 downto 0);
+  		IN_dataValid         : in std_logic;
+  		OUT_result           : out std_logic_vector(31 downto 0)
+  	);
+end component;  
+COMPONENT div_gen_0
+  PORT ( aclk                    : IN STD_LOGIC;
+         aresetn                 : IN STD_LOGIC;
+         s_axis_divisor_tvalid   : IN STD_LOGIC;
+         s_axis_divisor_tready   : OUT STD_LOGIC;
+         s_axis_divisor_tdata    : IN STD_LOGIC_VECTOR(31 DOWNTO 0);
+         s_axis_dividend_tvalid  : IN STD_LOGIC;
+         s_axis_dividend_tready  : OUT STD_LOGIC;
+         s_axis_dividend_tdata   : IN STD_LOGIC_VECTOR(31 DOWNTO 0);
+         m_axis_dout_tvalid      : OUT STD_LOGIC;
+         m_axis_dout_tuser       : OUT STD_LOGIC_VECTOR(0 DOWNTO 0);
+         m_axis_dout_tdata       : OUT STD_LOGIC_VECTOR(63 DOWNTO 0)
+        );
+END COMPONENT;
+-- Signals
+-- input capture signals
+signal data_valid_1ffsynced     : std_logic;  -- ff1 output
+signal data_valid_2ffsynced     : std_logic;  -- ff2 output
+-- Sampling signals 
+signal real_i                   : std_logic_vector(g_sampleResolution-1 downto 0);
+signal imag_i                   : std_logic_vector(g_sampleResolution-1 downto 0);
+
+signal real_reg_i               : std_logic_vector(g_sampleResolution-1 downto 0);
+signal imag_reg_i               : std_logic_vector(g_sampleResolution-1 downto 0);
+
+signal n_batch                  : std_logic_vector(2*g_sampleResolution downto 0);
+signal n_batch_delayed          : std_logic_vector(2*g_sampleResolution downto 0);
+signal n_batch_delay_ready      : std_logic;
+
+signal hse_result               : std_logic_vector(31 downto 0);
+signal cm_result                : std_logic_vector(31 downto 0);
+signal in_nrst                  : std_logic;
+signal zero_detected            : std_logic_vector(0 downto 0);
+signal div_result               : std_logic_vector(63 downto 0);
+signal div_ready                : std_logic;
+signal div_32                   : std_logic_vector(31 downto 0);
+begin
+--------------------------------------------------------
+-- 0. 2ff synchronizing of the control signal data_valid
+--------------------------------------------------------
+two_ff_sync: process(in_rst, in_clk)
+begin
+  if(in_rst = '1')then
+    data_valid_1ffsynced  <= '0';
+    data_valid_2ffsynced  <= '0';
+  elsif(rising_edge(in_clk))then
+    data_valid_1ffsynced  <= IN_dataValid;
+    data_valid_2ffsynced  <= data_valid_1ffsynced;
+  end if;
+end process;
+------------------------------------------------
+-- 1. Input capture
+------------------------------------------------
+input_capture: process(in_rst, in_clk)
+begin
+  if(in_rst = '1')then
+    real_i          <= (others => '0');
+    real_reg_i      <= (others => '0'); 
+	
+    imag_i          <= (others => '0');
+    imag_reg_i      <= (others => '0');
+
+  elsif(rising_edge(in_clk))then
+    real_i          <= In_dataReal;
+    real_reg_i      <= real_i;
+    	
+    imag_i          <= In_dataImag;
+    imag_reg_i      <= imag_i; 
+
+  end if;  
+end process;
+-------------------------------------------------
+-- 1. Instantiate denominator (half symbol energy)
+-------------------------------------------------
+hse_inst: half_symbol_energy
+  generic map ( g_subseq_length      => g_subseq_length,
+  		        g_sampleResolution   => g_sampleResolution
+      	       )
+  port map ( IN_clk               => IN_clk,
+  		     IN_rst               => IN_rst,
+  		     IN_dataReal          => IN_dataReal,
+  		     IN_dataImag          => IN_dataImag,
+  		     IN_dataValid         => IN_dataValid,
+  		     OUT_result           => hse_result
+  	         );
+--------------------------------------------
+-- 2. Instantiate input delay FIFO
+--------------------------------------------
+n_input_delay: genericFifo generic map( g_writeDepth          => 8,        
+                                        g_wrDataWidth         => 2*g_sampleResolution+1,  
+                                        g_rdDataWidth         => 2*g_sampleResolution+1     
+                                       )
+                           port map ( IN_aRst                  => in_rst,                                                                  
+                                      IN_clk                   => in_clk,								
+                                      IN_din                   => n_batch,
+                                      IN_wrEn                  => in_nrst,                                                               
+                                      IN_rdEn                  => n_batch_delay_ready,     
+                                      IN_progFullThresh        => std_logic_vector(TO_UNSIGNED(6, hs_log2(8))),                                 
+                                      OUT_dout                 => n_batch_delayed,
+                                      OUT_progFull             => n_batch_delay_ready
+                                     );
+------------------------------------------------
+-- 3. Instantiate numerator (correlation metric)
+------------------------------------------------
+cm_inst: correlation_metric
+  generic map ( g_subseq_length      => g_subseq_length,
+  		        g_sampleResolution   => g_sampleResolution
+      	       )
+  port map ( IN_clk               => IN_clk,
+  		     IN_rst               => IN_rst,
+  		     IN_dataReal          => IN_dataReal,
+  		     IN_dataImag          => IN_dataImag,
+  		     IN_dataValid         => IN_dataValid,
+  		     OUT_result           => cm_result
+  	         );  
+------------------------------------------------------------
+-- 4. Instantiate divider IP(Xilinx blocking 32-bit divider)
+------------------------------------------------------------
+div_inst: div_gen_0
+  port map ( aclk                    => in_clk,
+             aresetn                 => in_nrst,
+             s_axis_divisor_tvalid   => in_nrst,
+             s_axis_divisor_tdata    => hse_result,
+             s_axis_dividend_tvalid  => in_nrst,
+             s_axis_dividend_tdata   => cm_result,
+             m_axis_dout_tvalid      => div_ready,
+             m_axis_dout_tuser       => zero_detected,
+             m_axis_dout_tdata       => div_result
+            );
+------------------------------------------------------
+-- Output process
+------------------------------------------------------
+out_process: process(in_clk, in_rst)
+begin
+  if(in_rst = '1') then
+    div_32              <= (others => '0');
+  elsif(rising_edge(in_clk))then
+    if(div_ready = '1') then 
+      if(zero_detected = "0") then
+        div_32            <= div_result(35 downto 4);
+      end if;     
+    end if;  
+  end if;  
+end process;            
+------------------------------------------------------------
+-- 5. Concurrent assignments
+------------------------------------------------------------
+n_batch 		   <= data_valid_2ffsynced & imag_reg_i & real_reg_i;
+OUT_dataReal       <= n_batch_delayed(g_sampleResolution-1 downto 0);  
+OUT_dataImag       <= n_batch_delayed(2*g_sampleResolution-1 downto g_sampleResolution);
+OUT_dataValid      <= n_batch_delayed(n_batch_delayed'length-1);
+in_nrst            <= not in_rst;
+
+OUT_syncMetric     <= div_32; 
+
+
+end structural;
