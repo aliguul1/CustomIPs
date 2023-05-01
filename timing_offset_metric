@@ -4,9 +4,6 @@ library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.NUMERIC_STD.ALL;
 
-LIBRARY Packages;
-USE Packages.pkg_customMath.all;
-
 entity timing_offset_metric is
   generic (
 		g_subseq_length         : integer  := 1024; --! In an OFDM system, typically but not necessaryly the FFT length.
